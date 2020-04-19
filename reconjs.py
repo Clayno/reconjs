@@ -1,3 +1,5 @@
+#!/usr/bin/python3
+# coding: utf-8
 import argparse
 import asyncio
 import aiohttp
@@ -15,7 +17,7 @@ class ReconJSAdapter(logging.LoggerAdapter):
         self.logger = logging.getLogger(logger_name)
 
     def info(self, msg, *args, **kwargs):
-        msg = u'{}'.format(msg)
+        msg = '{}'.format(msg)
         self.logger.info(msg, *args, **kwargs)
 
     def error(self, msg, *args, **kwargs):
@@ -60,9 +62,9 @@ async def check_unminified(url, session, logger, output_dir):
         if response.status in [401, 403, 404]:
             logger.debug("Couldn't find unminified file")
             return
-        logger.debug('Unminified file found')
-        text = await response.text()
-        open(os.path.join(output_dir, name), 'w').write(text)
+        logger.highlight('Unminified file found !')
+        text = await response.content.read()
+        open(os.path.join(output_dir, name), 'wb').write(text)
     else:
         logger.debug("Not a minified file")
 
@@ -70,32 +72,41 @@ async def check_map(url, session, logger, output_dir):
     url  = url.replace(".js", ".js.map")
     name = url.split('/')[-1]
     response = await session.get(url)
-    text = await response.text()
+    text = await response.content.read()
+    text = text.decode('utf-8')
     try:
         json.loads(text)
-        logger.debug(f"{url} map file found")
+        logger.highlight(f"{url} map file found !")
         open(os.path.join(output_dir, name), 'w').write(text)
     except:
         logger.debug(f"{url} not map file")
 
-async def parse_target(url, session, logger, output_dir):
+async def parse_target(url, session, logger, output_dir, output_file):
+    results = set()
     name = url.split('/')[-1]
     regex = r'''(['\"](https?:)?[/]{1,2}[^'\"> ]{5,})|(\.(get|post|ajax|load)\s*\(\s*['\"](https?:)?[/]{1,2}[^'\"> ]{5,})'''
     response = await session.get(url)
-    text = await response.text()
+    text = await response.content.read()
+    text = text.decode('utf-8')
     matches = re.findall(regex, text)
     for match in matches:
         if not re.match(r'\.(png|svg|jpg|jpeg|css)', match[0]):
-            logger.info(match[0].replace('"', '').replace("'", ''))
+            content = match[0].replace('"', '').replace("'", '')
+            if not output_file and content not in list(results):
+                logger.info(content)
+            results.add(content)
+
+    if output_file:
+        open(os.path.join(output_dir, output_file), "a").write('\n'.join(list(results)))
     open(os.path.join(output_dir, name), 'w').write(text)
 
-async def start(targets, logger, output_dir):
+async def start(targets, logger, output_dir, output_file=None):
     async with aiohttp.ClientSession() as session:
         tasks = []
         for target in targets:
             if re.match(r'.*\.js([^\w]+.*|$)', target):
                 logger.debug(f"{target} matched")
-                tasks.append(parse_target(target, session, logger, output_dir))
+                tasks.append(parse_target(target, session, logger, output_dir, output_file))
                 tasks.append(check_map(target, session, logger, output_dir))
                 tasks.append(check_unminified(target, session, logger, output_dir))
         await asyncio.gather(*tasks)
@@ -107,6 +118,7 @@ if __name__ == "__main__":
     parser.add_argument('-d', '--directory', action='store', help='Output directory')
     parser.add_argument('-f', '--file', action='store', help='File of URLs')
     parser.add_argument('-u', '--url', action='store', help='Target URL')
+    parser.add_argument('-o', '--output_file', action='store', help='Output file to store parsed content')
     args = parser.parse_args()
     level = logging.INFO
     if args.verbose:
@@ -127,4 +139,7 @@ if __name__ == "__main__":
     except FileExistsError:
         logger.debug("Directory already exists")
     logger.debug(f"Output dir: {output_dir}")
-    asyncio.run(start(targets, logger, output_dir))
+    if args.output_file:
+        asyncio.run(start(targets, logger, output_dir, output_file=args.output_file))
+    else:
+        asyncio.run(start(targets, logger, output_dir))
