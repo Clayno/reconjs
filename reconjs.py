@@ -10,6 +10,7 @@ import sys
 import os
 import json
 from termcolor import colored
+from urllib.parse import urljoin
 
 class ReconJSAdapter(logging.LoggerAdapter):
 
@@ -62,7 +63,7 @@ async def check_unminified(url, session, logger, output_dir):
         if response.status in [401, 403, 404]:
             logger.debug("Couldn't find unminified file")
             return
-        logger.highlight('Unminified file found !')
+        logger.highlight(f'{url} unminified file found !')
         text = await response.content.read()
         open(os.path.join(output_dir, name), 'wb').write(text)
     else:
@@ -81,10 +82,10 @@ async def check_map(url, session, logger, output_dir):
     except:
         logger.debug(f"{url} not map file")
 
-async def parse_target(url, session, logger, output_dir, output_file):
-    results = set()
-    name = url.split('/')[-1]
+async def parse_js(url, session, logger, output_dir, output_file):
     regex = r'''(['\"](https?:)?[/]{1,2}[^'\"> ]{5,})|(\.(get|post|ajax|load)\s*\(\s*['\"](https?:)?[/]{1,2}[^'\"> ]{5,})'''
+    results = {url}
+    name = url.split('/')[-1]
     response = await session.get(url)
     text = await response.content.read()
     text = text.decode('utf-8')
@@ -92,23 +93,39 @@ async def parse_target(url, session, logger, output_dir, output_file):
     for match in matches:
         if not re.match(r'\.(png|svg|jpg|jpeg|css)', match[0]):
             content = match[0].replace('"', '').replace("'", '')
-            if not output_file and content not in list(results):
+            if content not in list(results):
                 logger.info(content)
             results.add(content)
-
     if output_file:
         open(os.path.join(output_dir, output_file), "a").write('\n'.join(list(results)))
     open(os.path.join(output_dir, name), 'w').write(text)
+
+async def parse_html(url, session, logger, output_dir, output_file):
+    html_links = r'''(src|href)\s*[=:]\s*['\"]?([^'\">\s]*)'''
+    results = set()
+    tasks = []
+    response = await session.get(url)
+    text = await response.content.read()
+    text = text.decode('utf-8')
+    matches = re.findall(html_links, text)
+    for match in matches:
+        content = re.split(r'''(href|src)\s*[=:]\s*[\"']?''', match[1])[0]
+        joined = urljoin(url, content)
+        if not re.match(r'\.(png|svg|jpg|jpeg|css)', match[0]):
+            if joined not in list(results):
+                results.add(joined)
+                logger.debug(f'Parsing {joined}')
+                if re.match(r'.*\.js([^\w]+.*|$)', joined):
+                    tasks.append(parse_js(joined, session, logger, output_dir, output_file))
+                    tasks.append(check_map(joined, session, logger, output_dir))
+                    tasks.append(check_unminified(joined, session, logger, output_dir))
+    await asyncio.gather(*tasks)
 
 async def start(targets, logger, output_dir, output_file=None):
     async with aiohttp.ClientSession() as session:
         tasks = []
         for target in targets:
-            if re.match(r'.*\.js([^\w]+.*|$)', target):
-                logger.debug(f"{target} matched")
-                tasks.append(parse_target(target, session, logger, output_dir, output_file))
-                tasks.append(check_map(target, session, logger, output_dir))
-                tasks.append(check_unminified(target, session, logger, output_dir))
+            tasks.append(parse_html(target, session, logger, output_dir, output_file))
         await asyncio.gather(*tasks)
 
 
