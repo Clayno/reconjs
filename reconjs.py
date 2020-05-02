@@ -10,7 +10,7 @@ import sys
 import os
 import json
 from termcolor import colored
-from urllib.parse import urljoin
+from urllib.parse import urljoin, urlparse
 
 class ReconJSAdapter(logging.LoggerAdapter):
 
@@ -55,17 +55,27 @@ def setup_logger(level=logging.INFO, log_to_file=False, log_prefix=None, logger_
     logger.setLevel(level)
     return logger
 
+async def save_file(url, binary_content, output_dir):
+    parsed = urlparse(url)
+    name = os.path.basename(parsed.path)
+    file_path = os.path.join(output_dir, name)
+    logger.debug(f"Saving {url} to {file_path}")
+    open(file_path, 'wb').write(binary_content)
+
+async def download_file(url, session, output_dir):
+    logger.debug(f"Downloading {url}")
+    result = await session.get(url)
+    await save_file(url, await result.content.read(), output_dir)
+
 async def check_unminified(url, session, logger, output_dir):
     if ".min.js" in url:
         url  = url.replace(".min.js", ".js")
-        name = url.split('/')[-1]
         response = await session.get(url)
         if response.status in [401, 403, 404]:
             logger.debug("Couldn't find unminified file")
             return
         logger.highlight(f'{url} unminified file found !')
-        text = await response.content.read()
-        open(os.path.join(output_dir, name), 'wb').write(text)
+        await save_file(url, await response.content.read(), output_dir)
     else:
         logger.debug("Not a minified file")
 
@@ -73,22 +83,23 @@ async def check_map(url, session, logger, output_dir):
     url  = url.replace(".js", ".js.map")
     name = url.split('/')[-1]
     response = await session.get(url)
-    text = await response.content.read()
-    text = text.decode('utf-8')
+    binary_content = await response.content.read()
+    text = binary_content.decode('utf-8')
     try:
         json.loads(text)
         logger.highlight(f"{url} map file found !")
-        open(os.path.join(output_dir, name), 'w').write(text)
+        await save_file(url, binary_content, output_dir)
     except:
         logger.debug(f"{url} not map file")
 
 async def parse_js(url, session, logger, output_dir, output_file):
     regex = r'''(['\"](https?:)?[/]{1,2}[^'\"> ]{5,})|(\.(get|post|ajax|load)\s*\(\s*['\"](https?:)?[/]{1,2}[^'\"> ]{5,})'''
+    sourcemap_file = r'//#\ssourceMappingURL=(.*)'
     results = {url}
     name = url.split('/')[-1]
     response = await session.get(url)
-    text = await response.content.read()
-    text = text.decode('utf-8')
+    binary_content = await response.content.read()
+    text = binary_content.decode('utf-8')
     matches = re.findall(regex, text)
     for match in matches:
         if not re.match(r'\.(png|svg|jpg|jpeg|css)', match[0]):
@@ -96,9 +107,20 @@ async def parse_js(url, session, logger, output_dir, output_file):
             if content not in list(results):
                 logger.info(content)
             results.add(content)
+    sourcemap_files = re.findall(sourcemap_file, text)
+    fetch = []
+    for file_path in sourcemap_files:
+        file_path = file_path.strip()
+        if re.match(r'http(s)://', file_path):
+            tmp_url = file_path
+        else:
+            tmp_url = urljoin(url, file_path)
+        logger.highlight(f"{tmp_url} map file found !")
+        fetch.append(download_file(tmp_url, session, output_dir))
+    await asyncio.gather(*fetch)
     if output_file:
         open(os.path.join(output_dir, output_file), "a").write('\n'.join(list(results)))
-    open(os.path.join(output_dir, name), 'w').write(text)
+    await save_file(url, binary_content, output_dir)
 
 async def parse_html(url, session, logger, output_dir, output_file):
     html_links = r'''(src|href)\s*[=:]\s*['\"]?([^'\">\s]*)'''
@@ -121,10 +143,21 @@ async def parse_html(url, session, logger, output_dir, output_file):
                     tasks.append(check_unminified(joined, session, logger, output_dir))
     await asyncio.gather(*tasks)
 
-async def start(targets, logger, output_dir, output_file=None):
+async def start(targets, logger, directory_name=None, output_file=None):
     async with aiohttp.ClientSession() as session:
         tasks = []
         for target in targets:
+            if directory_name == None:
+                directory_name = urlparse(target).netloc
+            output_dir = os.path.join(os.getcwd(), directory_name)
+            output_dir = os.path.join(output_dir, '')
+            try:
+                os.makedirs(output_dir)
+            except FileExistsError:
+                logger.debug("Directory already exists")
+            logger.debug(f"Output dir: {output_dir}")
+            if output_file == None:
+                output_file = 'urls.lst'
             tasks.append(parse_html(target, session, logger, output_dir, output_file))
         await asyncio.gather(*tasks)
 
@@ -132,10 +165,10 @@ async def start(targets, logger, output_dir, output_file=None):
 if __name__ == "__main__":
     parser  = argparse.ArgumentParser(description="ReconJS - Recon JS files for fun and profit")
     parser.add_argument('-v', '--verbose', action='store_true', help='Enable verbose output')
-    parser.add_argument('-d', '--directory', action='store', help='Output directory')
+    parser.add_argument('-d', '--directory', action='store', help='Output directory. Default netloc')
     parser.add_argument('-f', '--file', action='store', help='File of URLs')
     parser.add_argument('-u', '--url', action='store', help='Target URL')
-    parser.add_argument('-o', '--output_file', action='store', help='Output file to store parsed content')
+    parser.add_argument('-o', '--output_file', action='store', help='Output file to store parsed content. Default urls.lst')
     args = parser.parse_args()
     level = logging.INFO
     if args.verbose:
@@ -148,15 +181,5 @@ if __name__ == "__main__":
         with open(args.file) as f:
             targets = f.readlines()
             targets = [target.strip() for target in targets]
-    directory = 'output' if not args.directory else args.directory
-    output_dir = os.path.join(os.getcwd(), directory)
-    output_dir = os.path.join(output_dir, '')
-    try:
-        os.makedirs(output_dir)
-    except FileExistsError:
-        logger.debug("Directory already exists")
-    logger.debug(f"Output dir: {output_dir}")
-    if args.output_file:
-        asyncio.run(start(targets, logger, output_dir, output_file=args.output_file))
-    else:
-        asyncio.run(start(targets, logger, output_dir))
+    directory = None if not args.directory else args.directory
+    asyncio.run(start(targets, logger, directory_name=args.directory, output_file=args.output_file))
