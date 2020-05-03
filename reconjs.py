@@ -9,6 +9,7 @@ import re
 import sys
 import os
 import json
+from typing import Set, Tuple
 from termcolor import colored
 from urllib.parse import urljoin, urlparse
 
@@ -31,10 +32,22 @@ class ReconJSAdapter(logging.LoggerAdapter):
 
     def success(self, msg, *args, **kwargs):
         msg = u'{} {}'.format(colored("[+]", 'green', attrs=['bold']), msg)
-        self.logger.info(msg, *args, **kwargs)
+        self.logger.debug(msg, *args, **kwargs)
 
     def highlight(self, msg, *args, **kwargs):
         msg = u'{}'.format(colored(msg, 'yellow', attrs=['bold']))
+        self.logger.info(msg, *args, **kwargs)
+
+    def url(self, msg, *args, **kwargs):
+        msg = u'{} {}'.format(colored("[url]", 'yellow', attrs=['bold']), msg)
+        self.logger.info(msg, *args, **kwargs)
+
+    def link(self, msg, *args, **kwargs):
+        msg = u'{} {}'.format(colored("[link]", 'cyan', attrs=['bold']), msg)
+        self.logger.info(msg, *args, **kwargs)
+
+    def subdomain(self, msg, *args, **kwargs):
+        msg = u'{} {}'.format(colored("[subdomain]", 'green', attrs=['bold']), msg)
         self.logger.info(msg, *args, **kwargs)
 
 def setup_logger(level=logging.INFO, log_to_file=False, log_prefix=None, logger_name='reconjs'):
@@ -55,17 +68,53 @@ def setup_logger(level=logging.INFO, log_to_file=False, log_prefix=None, logger_
     logger.setLevel(level)
     return logger
 
+class Target:
+    def __init__(self, base_url: str):
+        self.base_url: str = base_url
+        self.urls: Set[str] = set()
+        self.links: Set[str] = set()
+        self.top_domain, self.hostname = self._extract_top_domain(base_url)
+        self.subdomains: Set[str] = {self.hostname}
+
+    def add(self, name: str, value: str) -> None:
+        self.__getattribute__(name).add(value.strip())
+        self.check_subdomain(value)
+
+    def check_subdomain(self, url: str):
+        try:
+            top_domain, hostname = self._extract_top_domain(url)
+            if self.top_domain == top_domain:
+                if hostname not in self.subdomains:
+                    self.subdomains.add(hostname)
+                    logger.subdomain(hostname)
+                    return hostname
+            return None
+        except Exception as e:
+            return None
+    
+    def _extract_top_domain(self, url: str) -> Tuple[str,str]:
+        hostname = urlparse(url).hostname
+        if hostname.count('.') > 1:
+            return '.'.join(hostname.split('.')[-2:]), hostname
+        return hostname, hostname
+
+
 async def save_file(url, binary_content, output_dir):
     parsed = urlparse(url)
     name = os.path.basename(parsed.path)
     file_path = os.path.join(output_dir, name)
-    logger.debug(f"Saving {url} to {file_path}")
+    logger.success(f"Saving {url} to {file_path}")
     open(file_path, 'wb').write(binary_content)
+    return file_path
 
 async def download_file(url, session, output_dir):
-    logger.debug(f"Downloading {url}")
-    result = await session.get(url)
-    await save_file(url, await result.content.read(), output_dir)
+    try:
+        logger.debug(f"Downloading {url}")
+        result = await session.get(url)
+        return await save_file(url, await result.content.read(), output_dir)
+    except Exception as e:
+        #logger.error(e)
+        return None
 
 async def check_unminified(url, session, logger, output_dir):
     if ".min.js" in url:
@@ -81,32 +130,31 @@ async def check_unminified(url, session, logger, output_dir):
 
 async def check_map(url, session, logger, output_dir):
     url  = url.replace(".js", ".js.map")
-    name = url.split('/')[-1]
     response = await session.get(url)
     binary_content = await response.content.read()
     text = binary_content.decode('utf-8')
     try:
         json.loads(text)
-        logger.highlight(f"{url} map file found !")
-        await save_file(url, binary_content, output_dir)
+        file_path = await save_file(url, binary_content, output_dir)
+        target.add('urls', url)
+        logger.highlight(f"Map file saved at {file_path}")
     except:
         logger.debug(f"{url} not map file")
 
-async def parse_js(url, session, logger, output_dir, output_file):
+async def parse_js(url, session, logger, output_dir, target):
     regex = r'''(['\"](https?:)?[/]{1,2}[^'\"> ]{5,})|(\.(get|post|ajax|load)\s*\(\s*['\"](https?:)?[/]{1,2}[^'\"> ]{5,})'''
     sourcemap_file = r'//#\ssourceMappingURL=(.*)'
-    results = {url}
     name = url.split('/')[-1]
     response = await session.get(url)
     binary_content = await response.content.read()
     text = binary_content.decode('utf-8')
     matches = re.findall(regex, text)
     for match in matches:
-        if not re.match(r'\.(png|svg|jpg|jpeg|css)', match[0]):
+        if not re.search(r'\.(png|svg|jpg|jpeg|css)', match[0]):
             content = match[0].replace('"', '').replace("'", '')
-            if content not in list(results):
-                logger.info(content)
-            results.add(content)
+            if content.strip() not in target.links:
+                target.add('links', content)
+                logger.link(f'{content} FROM {url}')
     sourcemap_files = re.findall(sourcemap_file, text)
     fetch = []
     for file_path in sourcemap_files:
@@ -115,16 +163,14 @@ async def parse_js(url, session, logger, output_dir, output_file):
             tmp_url = file_path
         else:
             tmp_url = urljoin(url, file_path)
-        logger.highlight(f"{tmp_url} map file found !")
-        fetch.append(download_file(tmp_url, session, output_dir))
-    await asyncio.gather(*fetch)
-    if output_file:
-        open(os.path.join(output_dir, output_file), "a").write('\n'.join(list(results)))
+        file_path = await download_file(tmp_url, session, output_dir)
+        if file_path:
+            target.add('urls', tmp_url)
+            logger.highlight(f"Map file saved at {file_path}")
     await save_file(url, binary_content, output_dir)
 
-async def parse_html(url, session, logger, output_dir, output_file):
+async def parse_html(url, session, logger, output_dir, target):
     html_links = r'''(src|href)\s*[=:]\s*['\"]?([^'\">\s]*)'''
-    results = set()
     tasks = []
     response = await session.get(url)
     text = await response.content.read()
@@ -132,34 +178,44 @@ async def parse_html(url, session, logger, output_dir, output_file):
     matches = re.findall(html_links, text)
     for match in matches:
         content = re.split(r'''(href|src)\s*[=:]\s*[\"']?''', match[1])[0]
-        joined = urljoin(url, content)
-        if not re.match(r'\.(png|svg|jpg|jpeg|css)', match[0]):
-            if joined not in list(results):
-                results.add(joined)
-                logger.debug(f'Parsing {joined}')
+        if re.match(r'http(s)://', content):
+            joined = content.strip()
+        else:
+            joined = urljoin(url, content.strip())
+        # We don't need those crappy extensions
+        if not re.search(r'\.(png|svg|jpg|jpeg|css)', joined):
+            if joined.strip() not in target.urls:
+                target.add('urls', joined)
+                logger.url(joined)
+                # Check if this is a JS file
                 if re.match(r'.*\.js([^\w]+.*|$)', joined):
-                    tasks.append(parse_js(joined, session, logger, output_dir, output_file))
+                    tasks.append(parse_js(joined, session, logger, output_dir, target))
                     tasks.append(check_map(joined, session, logger, output_dir))
                     tasks.append(check_unminified(joined, session, logger, output_dir))
     await asyncio.gather(*tasks)
 
-async def start(targets, logger, directory_name=None, output_file=None):
+async def start(targets, logger, directory_name=None):
     async with aiohttp.ClientSession() as session:
         tasks = []
         for target in targets:
-            if directory_name == None:
-                directory_name = urlparse(target).netloc
-            output_dir = os.path.join(os.getcwd(), directory_name)
+            path = urlparse(target.base_url).netloc
+            if directory_name != None:
+                path = f"{directory_name}/{path}"
+            output_dir = os.path.join(os.getcwd(), path)
             output_dir = os.path.join(output_dir, '')
             try:
                 os.makedirs(output_dir)
             except FileExistsError:
                 logger.debug("Directory already exists")
             logger.debug(f"Output dir: {output_dir}")
-            if output_file == None:
-                output_file = 'urls.lst'
-            tasks.append(parse_html(target, session, logger, output_dir, output_file))
+            tasks.append(parse_html(target.base_url, session, logger, output_dir, target))
         await asyncio.gather(*tasks)
+    with open(os.path.join(output_dir, "urls.lst"), 'w') as urls:
+        urls.write('\n'.join(list(target.urls)))
+    with open(os.path.join(output_dir, "endpoints.lst"), 'w') as links:
+        links.write('\n'.join(list(target.links)))
+    with open(os.path.join(output_dir, "subdomains.lst"), 'w') as subdomains:
+        subdomains.write('\n'.join(list(target.subdomains)))
 
 
 if __name__ == "__main__":
@@ -168,7 +224,6 @@ if __name__ == "__main__":
     parser.add_argument('-d', '--directory', action='store', help='Output directory. Default netloc')
     parser.add_argument('-f', '--file', action='store', help='File of URLs')
     parser.add_argument('-u', '--url', action='store', help='Target URL')
-    parser.add_argument('-o', '--output_file', action='store', help='Output file to store parsed content. Default urls.lst')
     args = parser.parse_args()
     level = logging.INFO
     if args.verbose:
@@ -176,10 +231,10 @@ if __name__ == "__main__":
     setup_logger(level=level)
     logger = ReconJSAdapter()
     if args.url :
-        targets = [args.url]
+        targets = [Target(args.url)]
     if args.file:
         with open(args.file) as f:
             targets = f.readlines()
-            targets = [target.strip() for target in targets]
+            targets = [Target(target.strip()) for target in targets]
     directory = None if not args.directory else args.directory
-    asyncio.run(start(targets, logger, directory_name=args.directory, output_file=args.output_file))
+    asyncio.run(start(targets, logger, directory_name=args.directory))
