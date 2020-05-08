@@ -13,41 +13,66 @@ from typing import Set, Tuple
 from termcolor import colored
 from urllib.parse import urljoin, urlparse
 
-class ReconJSAdapter(logging.LoggerAdapter):
+UNINTERESTING_EXTENSIONS = ['css', 'svg', 'png', 'jpeg', 'jpg', 'mp4', 'gif']
+UNINTERESTING_JS_FILES = ['bootstrap', 'jquery']
 
-    def __init__(self, logger_name='reconjs'):
+
+class ReconJSAdapter(logging.LoggerAdapter):
+    raw = False
+
+    def __init__(self, logger_name='reconjs', raw=False):
         self.logger = logging.getLogger(logger_name)
+        self.raw = raw
 
     def info(self, msg, *args, **kwargs):
         msg = '{}'.format(msg)
         self.logger.info(msg, *args, **kwargs)
 
     def error(self, msg, *args, **kwargs):
-        msg = u'{} {}'.format(colored("[x]", 'red', attrs=['bold']), msg)
+        pre = "[x]"
+        if not self.raw:
+            pre = colored(pre, 'red', attrs=['bold'])
+        msg = u'{} {}'.format(pre, msg)
         self.logger.error(msg, *args, **kwargs)
 
     def debug(self, msg, *args, **kwargs):
-        msg = u'{} {}'.format(colored("[d]", 'green'), msg)
+        pre = "[d]"
+        if not self.raw:
+            pre = colored(pre, 'green')
+        msg = u'{} {}'.format(pre, msg)
         self.logger.debug(msg, *args, **kwargs)
 
     def success(self, msg, *args, **kwargs):
-        msg = u'{} {}'.format(colored("[+]", 'green', attrs=['bold']), msg)
+        pre = "[+]" 
+        if not self.raw:
+            pre = colored(pre, 'green', attrs=['bold'])
+        msg = u'{} {}'.format(pre, msg)
         self.logger.debug(msg, *args, **kwargs)
 
     def highlight(self, msg, *args, **kwargs):
-        msg = u'{}'.format(colored(msg, 'yellow', attrs=['bold']))
+        if not self.raw:
+            msg = u'{}'.format(colored(msg, 'yellow', attrs=['bold']))
         self.logger.info(msg, *args, **kwargs)
 
     def url(self, msg, *args, **kwargs):
-        msg = u'{} {}'.format(colored("[url]", 'yellow', attrs=['bold']), msg)
+        pre = "[url]" 
+        if not self.raw:
+            pre = colored(pre, 'red', attrs=['bold'])
+        msg = u'{} {}'.format(pre, msg)
         self.logger.info(msg, *args, **kwargs)
 
-    def link(self, msg, *args, **kwargs):
-        msg = u'{} {}'.format(colored("[link]", 'cyan', attrs=['bold']), msg)
+    def endpoint(self, msg, *args, **kwargs):
+        pre = "[endpoint]" 
+        if not self.raw:
+            pre = colored(pre, 'cyan', attrs=['bold'])
+        msg = u'{} {}'.format(pre, msg)
         self.logger.info(msg, *args, **kwargs)
 
     def subdomain(self, msg, *args, **kwargs):
-        msg = u'{} {}'.format(colored("[subdomain]", 'green', attrs=['bold']), msg)
+        pre = "[subdomain]"
+        if not self.raw:
+            pre = colored(pre, 'green', attrs=['bold'])
+        msg = u'{} {}'.format(pre, msg)
         self.logger.info(msg, *args, **kwargs)
 
 def setup_logger(level=logging.INFO, log_to_file=False, log_prefix=None, logger_name='reconjs'):
@@ -72,8 +97,8 @@ class Target:
     def __init__(self, base_url: str):
         self.base_url: str = base_url
         self.urls: Set[str] = set()
-        self.links: Set[str] = set()
-        self.top_domain, self.hostname = self._extract_top_domain(base_url)
+        self.endpoints: Set[str] = set()
+        self.top_domain, self.hostname  = self._extract_top_domain(base_url)
         self.subdomains: Set[str] = {self.hostname}
 
     def add(self, name: str, value: str) -> None:
@@ -109,6 +134,7 @@ async def save_file(url, binary_content, output_dir):
 
 async def download_file(url, session, output_dir):
     try:
+
         logger.debug(f"Downloading {url}")
         result = await session.get(url)
         return await save_file(url, await result.content.read(), output_dir)
@@ -150,11 +176,11 @@ async def parse_js(url, session, logger, output_dir, target):
     text = binary_content.decode('utf-8')
     matches = re.findall(regex, text)
     for match in matches:
-        if not re.search(r'\.(png|svg|jpg|jpeg|css)', match[0]):
+        if not any(f'.{ext}' in match[0] for ext in UNINTERESTING_EXTENSIONS):
             content = match[0].replace('"', '').replace("'", '')
-            if content.strip() not in target.links:
-                target.add('links', content)
-                logger.link(f'{content} FROM {url}')
+            if content.strip() not in target.endpoints:
+                target.add('endpoints', content)
+                logger.endpoint(f'{content} FROM {url}')
     sourcemap_files = re.findall(sourcemap_file, text)
     fetch = []
     for file_path in sourcemap_files:
@@ -183,15 +209,16 @@ async def parse_html(url, session, logger, output_dir, target):
         else:
             joined = urljoin(url, content.strip())
         # We don't need those crappy extensions
-        if not re.search(r'\.(png|svg|jpg|jpeg|css)', joined):
+        if not any(f'.{ext}' in joined for ext in UNINTERESTING_EXTENSIONS):
             if joined.strip() not in target.urls:
                 target.add('urls', joined)
                 logger.url(joined)
                 # Check if this is a JS file
                 if re.match(r'.*\.js([^\w]+.*|$)', joined):
-                    tasks.append(parse_js(joined, session, logger, output_dir, target))
-                    tasks.append(check_map(joined, session, logger, output_dir))
-                    tasks.append(check_unminified(joined, session, logger, output_dir))
+                    if not any(keyword in joined for keyword in UNINTERESTING_JS_FILES):
+                        tasks.append(parse_js(joined, session, logger, output_dir, target))
+                        tasks.append(check_map(joined, session, logger, output_dir))
+                        tasks.append(check_unminified(joined, session, logger, output_dir))
     await asyncio.gather(*tasks)
 
 async def start(targets, logger, directory_name=None):
@@ -212,8 +239,8 @@ async def start(targets, logger, directory_name=None):
         await asyncio.gather(*tasks)
     with open(os.path.join(output_dir, "urls.lst"), 'w') as urls:
         urls.write('\n'.join(list(target.urls)))
-    with open(os.path.join(output_dir, "endpoints.lst"), 'w') as links:
-        links.write('\n'.join(list(target.links)))
+    with open(os.path.join(output_dir, "endpoints.lst"), 'w') as endpoints:
+        endpoints.write('\n'.join(list(target.endpoints)))
     with open(os.path.join(output_dir, "subdomains.lst"), 'w') as subdomains:
         subdomains.write('\n'.join(list(target.subdomains)))
 
@@ -224,12 +251,14 @@ if __name__ == "__main__":
     parser.add_argument('-d', '--directory', action='store', help='Output directory. Default netloc')
     parser.add_argument('-f', '--file', action='store', help='File of URLs')
     parser.add_argument('-u', '--url', action='store', help='Target URL')
+    parser.add_argument('-r', '--raw', action='store_true', help='Raw output, without colors', 
+            default=False)
     args = parser.parse_args()
     level = logging.INFO
     if args.verbose:
         level = logging.DEBUG
     setup_logger(level=level)
-    logger = ReconJSAdapter()
+    logger = ReconJSAdapter(raw=args.raw)
     if args.url :
         targets = [Target(args.url)]
     if args.file:
